@@ -2,7 +2,7 @@
 e621 tagger - database updater
 
 Author: AyoKeito
-Version: 1.3
+Version: 1.4
 GitHub: https://github.com/AyoKeito/e621updater-python
 """
 
