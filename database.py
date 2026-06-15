@@ -2,7 +2,7 @@
 e621 tagger - database updater
 
 Author: AyoKeito
-Version: 1.3
+Version: 1.4
 GitHub: https://github.com/AyoKeito/e621updater-python
 """
 
@@ -72,51 +72,80 @@ def check_database_update(web_date):
 
     return False
 
-async def download_file(session, url, destination=None, progress_bar=None, task_id=None, description="Downloading"):
-    async with session.get(url, headers={'User-Agent': 'e621 tagger'}, proxy=args.proxy) as resp:
-        if resp.status == 200:
-            total_size = int(resp.headers.get('content-length', 0))
-            content = bytearray()
-
-            # Use provided progress bar or create a simple one
-            if progress_bar and task_id is not None:
-                # Update the existing task with total size and description
-                progress_bar.update(task_id, total=total_size, description=description)
-
-                async for chunk in resp.content.iter_any():
-                    content.extend(chunk)
-                    chunk_size = len(chunk)
-                    progress_bar.update(task_id, advance=chunk_size)
+async def get_file_info(session, url):
+    """Fetch file metadata (size, last-modified) via HEAD request"""
+    try:
+        async with session.head(url, headers={'User-Agent': 'e621 tagger'}, proxy=args.proxy, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                content_length = int(resp.headers.get('content-length', 0))
+                last_modified = resp.headers.get('last-modified', None)
+                return content_length, last_modified
             else:
-                # Fallback: create simple progress bar for standalone downloads
-                progress = Progress(
-                    TextColumn("[bold blue]Downloading", justify="right"),
-                    BarColumn(bar_width=40),
-                    "[progress.percentage]{task.percentage:>3.1f}%",
-                    "•",
-                    DownloadColumn(),
-                    "•",
-                    TransferSpeedColumn(),
-                    console=Console(),
-                    transient=False
-                )
+                print(f"Warning: HEAD request returned status {resp.status} for {url}")
+                return None, None
+    except asyncio.TimeoutError:
+        print(f"Error: Timeout while fetching file info for {url}")
+        return None, None
+    except Exception as e:
+        print(f"Error fetching file info for {url}: {e}")
+        return None, None
 
-                with progress:
-                    if total_size > 0:
-                        task = progress.add_task("download", total=total_size)
-                    else:
-                        task = progress.add_task("download", total=None)
+async def download_file(session, url, destination=None, progress_bar=None, task_id=None, description="Downloading"):
+    try:
+        async with session.get(url, headers={'User-Agent': 'e621 tagger'}, proxy=args.proxy, timeout=aiohttp.ClientTimeout(total=None)) as resp:
+            if resp.status == 200:
+                total_size = int(resp.headers.get('content-length', 0))
+                content = bytearray()
+
+                # Use provided progress bar or create a simple one
+                if progress_bar and task_id is not None:
+                    # Update the existing task with total size and description
+                    progress_bar.update(task_id, total=total_size, description=description)
 
                     async for chunk in resp.content.iter_any():
                         content.extend(chunk)
                         chunk_size = len(chunk)
-                        progress.update(task, advance=chunk_size)
+                        progress_bar.update(task_id, advance=chunk_size)
+                else:
+                    # Fallback: create simple progress bar for standalone downloads
+                    progress = Progress(
+                        TextColumn("[bold blue]Downloading", justify="right"),
+                        BarColumn(bar_width=40),
+                        "[progress.percentage]{task.percentage:>3.1f}%",
+                        "•",
+                        DownloadColumn(),
+                        "•",
+                        TransferSpeedColumn(),
+                        console=Console(),
+                        transient=False
+                    )
 
-            if destination:
-                with open(destination, 'wb') as f:
-                    f.write(content)
+                    with progress:
+                        if total_size > 0:
+                            task = progress.add_task("download", total=total_size)
+                        else:
+                            task = progress.add_task("download", total=None)
 
-            return content
+                        async for chunk in resp.content.iter_any():
+                            content.extend(chunk)
+                            chunk_size = len(chunk)
+                            progress.update(task, advance=chunk_size)
+
+                if destination:
+                    with open(destination, 'wb') as f:
+                        f.write(content)
+
+                return content
+            else:
+                print(f"Error: Download failed with status {resp.status} for {url}")
+                return None
+    except asyncio.TimeoutError:
+        print(f"Error: Download timeout for {url}")
+        return None
+    except Exception as e:
+        print(f"Error downloading {url}: {e}")
+        traceback.print_exc()
+        return None
             
 async def download_exiftool(session):
     exiftool_url = "https://sourceforge.net/projects/exiftool/files/latest/download"
@@ -126,232 +155,281 @@ async def download_exiftool(session):
 
         if exiftool_content:
             print("Extracting ExifTool executable")
-            with zipfile.ZipFile(io.BytesIO(exiftool_content), 'r') as zip_ref:
-                # Find exiftool(-k).exe in the versioned folder
-                exiftool_path = None
-                version_dir = None
-                for name in zip_ref.namelist():
-                    if name.endswith('exiftool(-k).exe'):
-                        exiftool_path = name
-                        version_dir = name.split('/')[0]
-                        break
+            try:
+                with zipfile.ZipFile(io.BytesIO(exiftool_content), 'r') as zip_ref:
+                    # Find exiftool(-k).exe in the versioned folder
+                    exiftool_path = None
+                    version_dir = None
+                    for name in zip_ref.namelist():
+                        if name.endswith('exiftool(-k).exe'):
+                            exiftool_path = name
+                            version_dir = name.split('/')[0]
+                            break
 
-                if exiftool_path and version_dir:
-                    # Extract the entire contents to preserve dependencies
-                    zip_ref.extractall()
-                    # Move exiftool(-k).exe to working directory and rename
-                    os.rename(exiftool_path, "exiftool.exe")
-                    # Move exiftool_files directory to working directory (needed for dependencies)
-                    import shutil
-                    exiftool_files_path = f"{version_dir}/exiftool_files"
-                    if os.path.exists(exiftool_files_path):
-                        if os.path.exists("exiftool_files"):
-                            shutil.rmtree("exiftool_files")
-                        shutil.move(exiftool_files_path, "exiftool_files")
-                    # Clean up the extracted version directory
-                    if os.path.exists(version_dir):
-                        shutil.rmtree(version_dir)
+                    if exiftool_path and version_dir:
+                        # Extract the entire contents to preserve dependencies
+                        zip_ref.extractall()
+                        # Move exiftool(-k).exe to working directory and rename
+                        os.rename(exiftool_path, "exiftool.exe")
+                        # Move exiftool_files directory to working directory (needed for dependencies)
+                        import shutil
+                        exiftool_files_path = f"{version_dir}/exiftool_files"
+                        if os.path.exists(exiftool_files_path):
+                            if os.path.exists("exiftool_files"):
+                                shutil.rmtree("exiftool_files")
+                            shutil.move(exiftool_files_path, "exiftool_files")
+                        # Clean up the extracted version directory
+                        if os.path.exists(version_dir):
+                            shutil.rmtree(version_dir)
+                    else:
+                        print("Error: Could not find exiftool(-k).exe in the archive")
+            except zipfile.BadZipFile:
+                print("Error: Failed to extract ExifTool - archive may be corrupted")
+            except Exception as e:
+                print(f"Error: Failed to extract ExifTool: {e}")
 
-            os.remove('exiftool.zip') if os.path.exists('exiftool.zip') else None
+            if os.path.exists('exiftool.zip'):
+                os.remove('exiftool.zip')
+        else:
+            print("Error: Failed to download ExifTool")
     else:
         print("ExifTool already exists. Skipping download.")
 
-async def main(url, proxy, use_multithreaded=False):
+async def main(proxy, use_multithreaded=False):
+    base_url = "https://static1.e621.net/data/db_export/"
+    posts_file = "posts.csv.gz"
+    tags_file = "tags.csv.gz"
+    
+    posts_url = base_url + posts_file
+    tags_url = base_url + tags_file
+    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers={'User-Agent': 'e621 tagger'}, proxy=args.proxy) as resp:
-                if resp.status == 200:
-                    await download_exiftool(session)  # Pass the session to download_exiftool function
-                    print(f"\033[1mStep 1:\033[0m Got response from \033[96m{url}\033[0m")
-                    content = await resp.text()
-                    file_links = re.findall(r'<a href="(.*?)">', content)
-                    # After finding the latest_posts link
-                    posts_files = [x for x in file_links if x.startswith("posts")]
-                    if not posts_files:
-                        print("Error: No posts files found on the server.")
+            print(f"\033[1mStep 1:\033[0m Connecting to \033[96m{base_url}\033[0m")
+            
+            # Get file info for posts
+            print(f"\033[1mStep 2:\033[0m Fetching file info for posts database...")
+            posts_size, posts_date = await get_file_info(session, posts_url)
+            
+            if posts_size is None:
+                print("Error: Could not fetch posts database info. Aborting.")
+                return
+            
+            posts_size_mb = posts_size / (1024 ** 2)
+            print(f"Latest posts file: \033[96m{posts_file}\033[0m")
+            print(f"Filesize: \033[96m{posts_size_mb:.2f} MB\033[0m")
+            if posts_date:
+                print(f"Last modified: \033[96m{posts_date}\033[0m")
+            
+            # Get file info for tags
+            print(f"\033[1mStep 3:\033[0m Fetching file info for tags database...")
+            tags_size, tags_date = await get_file_info(session, tags_url)
+            
+            if tags_size is None:
+                print("Error: Could not fetch tags database info. Aborting.")
+                return
+            
+            tags_size_mb = tags_size / (1024 ** 2)
+            print(f"Latest tags file: \033[96m{tags_file}\033[0m")
+            print(f"Filesize: \033[96m{tags_size_mb:.2f} MB\033[0m")
+            if tags_date:
+                print(f"Last modified: \033[96m{tags_date}\033[0m")
+            
+            # Parse the date for database update check
+            # Convert HTTP date format (RFC 2822) to our format
+            # Example: "Sun, 15 Jun 2025 12:30:45 GMT"
+            date_for_check = None
+            if posts_date:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt_obj = parsedate_to_datetime(posts_date)
+                    date_for_check = dt_obj.strftime('%d-%b-%Y %H:%M')
+                except Exception as e:
+                    print(f"Warning: Could not parse date: {e}")
+            
+            # Check if the database is up-to-date
+            if date_for_check:
+                database_updated = check_database_update(date_for_check)
+            else:
+                database_updated = False
+                
+            if not os.path.exists("artists.parquet"):
+                # If the file doesn't exist, update unconditionally
+                print("Downloading the database since the file doesn't exist.")
+                update_choice = 'y'
+            elif not database_updated:
+                # If the file exists but is outdated, prompt the user
+                update_choice = input("\033[1mThe local database is outdated. Do you want to update? (Y/N):\033[0m ").lower().strip()
+                if update_choice not in ['y', 'yes', 'n', 'no']:
+                    print("Invalid input, defaulting to 'no'")
+                    update_choice = 'n'
+            else:
+                # If the file exists and is up-to-date, skip the update
+                print("Recent database, skipping downloads.")
+                return
+
+            # Check if user wants to proceed with the update
+            if update_choice in ['n', 'no']:
+                print("Database update skipped by user choice.")
+                return
+
+            # Download exiftool before processing
+            await download_exiftool(session)
+
+            # Continue with the update process
+            try:
+                # Create unified progress bar for all operations
+                main_progress = Progress(
+                    TextColumn("[bold cyan]{task.description}", justify="right"),
+                    BarColumn(bar_width=40),
+                    "[progress.percentage]{task.percentage:>3.1f}%",
+                    "•",
+                    DownloadColumn(),
+                    "•",
+                    TransferSpeedColumn(),
+                    "•",
+                    TimeRemainingColumn(),
+                    console=Console(),
+                    transient=False
+                )
+
+                with main_progress:
+                    print(f"\033[1mStep 4:\033[0m Downloading posts database...")
+                    start_time = time.time()
+
+                    # Create download task
+                    download_task = main_progress.add_task("Downloading posts database...", total=posts_size)
+                    posts_content = await download_file(session, posts_url,
+                                                       progress_bar=main_progress, task_id=download_task)
+
+                    if posts_content is None:
+                        print("Error: Failed to download posts database. Aborting.")
                         return
-                    latest_posts_link = sorted(posts_files, reverse=True)[0]
 
-                    # Escape special characters in the latest_posts_link
-                    escaped_latest_posts_link = re.escape(latest_posts_link)
+                    end_time = time.time()
+                    time_taken = end_time - start_time
+                    print(f"Downloaded {posts_file} in {time_taken:.2f} seconds.")
 
-                    # Construct the regex pattern using f-string
-                    regex_pattern = rf'<a href="{escaped_latest_posts_link}">(.*?)</a>\s+(\d{{2}}-[a-zA-Z]{{3}}-\d{{4}} \d{{2}}:\d{{2}})\s+(\d+)'
+                    # Decompress the content
+                    try:
+                        posts_content = gzip.decompress(posts_content)
+                    except Exception as e:
+                        print(f"Error: Failed to decompress posts file: {e}")
+                        return
 
-                    # Extracting the filename and filesize using a regular expression
-                    file_info_match = re.search(regex_pattern, content)
-
-                    if file_info_match:
-                        filename = file_info_match.group(1)
-                        date = file_info_match.group(2)
-                        filesize = int(file_info_match.group(3))
-                        filesize_mb = filesize / (1024 ** 2)  # Convert bytes to megabytes
-
-                        print(f"Latest posts file: \033[96m{filename}\033[0m")
-                        print(f"Date: \033[96m{date}\033[0m")
-                        print(f"Filesize: \033[96m{filesize_mb:.2f} MB\033[0m")  # Print filesize in megabytes with two decimal places
-                        
-                    # Check if the database is up-to-date
-                    database_updated = check_database_update(date)
-                    if not os.path.exists("artists.parquet"):
-                        # If the file doesn't exist, update unconditionally
-                        print("Downloading the database since the file doesn't exist.")
-                        update_choice = 'y'  # Set update_choice to 'y' to proceed with the update unconditionally
-                    elif not database_updated:
-                        # If the file exists but is outdated, prompt the user
-                        update_choice = input("\033[1mThe local database is outdated. Do you want to update? (Y/N):\033[0m ").lower().strip()
-                        if update_choice not in ['y', 'yes', 'n', 'no']:
-                            print("Invalid input, defaulting to 'no'")
-                            update_choice = 'n'
+                    if use_multithreaded:
+                        with open('latest_posts.csv', 'wb') as f:
+                            f.write(posts_content)
+                        del posts_content
+                        print(f"Processing in \033[92mmultithreaded\033[0m mode, \033[92m{modin.config.NPartitions.get()}\033[0m threads detected, initializing Modin RAY engine...")
+                        ray.init()
                     else:
-                        # If the file exists and is up-to-date, skip the update
-                        print("Recent database, skipping downloads.")
-                        return
+                        print(f"Processing in \033[93mfast\033[0m mode...")
 
-                    # Check if user wants to proceed with the update
-                    if update_choice in ['n', 'no']:
-                        print("Database update skipped by user choice.")
-                        return
-
-                    # Continue with the update process
+                    print(f"\033[1mStep 5:\033[0m Reading extracted posts CSV as a DataFrame")
                     try:
-                        # Create unified progress bar for all operations
-                        main_progress = Progress(
-                            TextColumn("[bold cyan]{task.description}", justify="right"),
-                            BarColumn(bar_width=40),
-                            "[progress.percentage]{task.percentage:>3.1f}%",
-                            "•",
-                            DownloadColumn(),
-                            "•",
-                            TransferSpeedColumn(),
-                            "•",
-                            TimeRemainingColumn(),
-                            console=Console(),
-                            transient=False
-                        )
-
-                        with main_progress:
-                            print(f"\033[1mStep 2:\033[0m Downloading \033[96m{latest_posts_link}\033[0m")
-                            start_time = time.time()
-
-                            # Create download task
-                            download_task = main_progress.add_task("Downloading posts database...", total=None)
-                            posts_content = gzip.decompress(await download_file(session, url + latest_posts_link,
-                                                                               progress_bar=main_progress, task_id=download_task))
-
-                            end_time = time.time()
-                            time_taken = end_time - start_time
-                            print(f"Downloaded {latest_posts_link} in {time_taken:.2f} seconds.")
-
-                            if use_multithreaded:
-                                with open('latest_posts.csv', 'wb') as f:
-                                    f.write(posts_content)
-                                del posts_content
-                                print(f"Processing in \033[92mmultithreaded\033[0m mode, \033[92m{modin.config.NPartitions.get()}\033[0m threads detected, initializing Modin RAY engine...")
-                                ray.init()
-                            else:
-                                print(f"Processing in \033[93mfast\033[0m mode...")
-
-                            print(f"\033[1mStep 3:\033[0m Reading extracted posts CSV as a DataFrame")
-                            if use_polars and not use_multithreaded:
-                                # Use Polars for optimal performance (6x faster)
-                                posts_df = pl.read_csv(io.BytesIO(posts_content), columns=["id", "md5", "tag_string"])
-                                del posts_content
-                            elif use_multithreaded:
-                                posts_df = pd.read_csv('latest_posts.csv', usecols=["id", "md5", "tag_string"])
-                            else:
-                                posts_df = pds.read_csv(io.BytesIO(posts_content), usecols=["id", "md5", "tag_string"])
-                                del posts_content
-
-                            print(f"\033[1mStep 4:\033[0m Saving DataFrame to posts.parquet")
-                            if use_multithreaded:
-                                os.remove('latest_posts.csv')  # Delete the temporary file
-                                posts_df.to_parquet("posts.parquet", engine='pyarrow', compression='zstd')
-                                ray.shutdown()
-                            elif use_polars:
-                                posts_df.write_parquet("posts.parquet", compression="zstd")
-                            else:
-                                posts_df.to_parquet("posts.parquet", engine='pyarrow', compression='zstd')
-
-                        del posts_df
-                        print(f"\033[32mStep 5:\033[0m posts.parquet done!\033[0m")
+                        if use_polars and not use_multithreaded:
+                            # Use Polars for optimal performance (6x faster)
+                            posts_df = pl.read_csv(io.BytesIO(posts_content), columns=["id", "md5", "tag_string"])
+                            del posts_content
+                        elif use_multithreaded:
+                            posts_df = pd.read_csv('latest_posts.csv', usecols=["id", "md5", "tag_string"])
+                        else:
+                            posts_df = pds.read_csv(io.BytesIO(posts_content), usecols=["id", "md5", "tag_string"])
+                            del posts_content
                     except Exception as e:
-                        print("An error occurred while downloading or processing the latest posts:", e)
-                        traceback.print_exc()
+                        print(f"Error: Failed to read posts CSV: {e}")
                         return
 
-                    tags_files = [x for x in file_links if x.startswith("tags")]
-                    if not tags_files:
-                        print("Error: No tags files found on the server.")
-                        return
-                    latest_tags = sorted(tags_files, reverse=True)[0]
+                    print(f"\033[1mStep 6:\033[0m Saving DataFrame to posts.parquet")
                     try:
-                        # Create unified progress bar for tags operations
-                        tags_progress = Progress(
-                            TextColumn("[bold cyan]{task.description}", justify="right"),
-                            BarColumn(bar_width=40),
-                            "[progress.percentage]{task.percentage:>3.1f}%",
-                            "•",
-                            DownloadColumn(),
-                            "•",
-                            TransferSpeedColumn(),
-                            "•",
-                            TimeRemainingColumn(),
-                            console=Console(),
-                            transient=False
-                        )
-
-                        with tags_progress:
-                            print(f"\033[1mStep 6:\033[0m Downloading latest tags file {latest_tags}")
-
-                            # Create download task for tags
-                            tags_download_task = tags_progress.add_task("Downloading tags database...", total=None)
-                            tags_content = gzip.decompress(await download_file(session, url + latest_tags,
-                                                                              progress_bar=tags_progress, task_id=tags_download_task)).decode()
-
-                            print(f"\033[1mStep 7:\033[0m Reading {latest_tags} as a DataFrame")
-                            if use_polars:
-                                # Use Polars for faster processing
-                                df = pl.read_csv(io.BytesIO(bytes(tags_content, "utf-8")),
-                                               schema_overrides={"id": pl.Int64, "name": pl.Utf8, "category": pl.Int64, "post_count": pl.Int64})
-
-                                print(f"\033[1mStep 8:\033[0m Filtering DataFrame to only include rows where category is equal to 1 (artists)")
-                                print(f"\033[1mStep 9:\033[0m Keeping only the 'name' column from the DataFrame")
-                                # Filter and select in one operation with Polars
-                                df = df.filter(pl.col("category") == 1).select("name")
-                            else:
-                                df = pds.read_csv(io.BytesIO(bytes(tags_content, "utf-8")), header=0, dtype={"id": int, "name": str, "category": int, "post_count": int})
-
-                                print(f"\033[1mStep 8:\033[0m Filtering DataFrame to only include rows where category is equal to 1 (artists)")
-                                df = df[df["category"] == 1]
-
-                                print(f"\033[1mStep 9:\033[0m Keeping only the 'name' column from the DataFrame")
-                                df = df[["name"]]
-
-                            print(f"\033[1mStep 10:\033[0m Saving DataFrame to artists.parquet")
-                            if os.path.exists('artists.parquet'):
-                                os.remove('artists.parquet')
-
-                            if use_polars:
-                                df.write_parquet("artists.parquet", compression="zstd")
-                            else:
-                                df.to_parquet("artists.parquet", engine='pyarrow', compression='zstd')
-
-                        print(f"\033[32mStep 11:\033[0m artists.parquet done!\033[0m")
-                        del df
+                        if use_multithreaded:
+                            os.remove('latest_posts.csv')  # Delete the temporary file
+                            posts_df.to_parquet("posts.parquet", engine='pyarrow', compression='zstd')
+                            ray.shutdown()
+                        elif use_polars:
+                            posts_df.write_parquet("posts.parquet", compression="zstd")
+                        else:
+                            posts_df.to_parquet("posts.parquet", engine='pyarrow', compression='zstd')
                     except Exception as e:
-                        print("An error occurred while downloading or processing the latest tags:", e)
-                        traceback.print_exc()
+                        print(f"Error: Failed to save posts.parquet: {e}")
                         return
+
+                    del posts_df
+                    print(f"\033[32mStep 7:\033[0m posts.parquet done!\033[0m")
+                    
+                    # Download tags
+                    print(f"\033[1mStep 8:\033[0m Downloading tags database...")
+                    tags_download_task = main_progress.add_task("Downloading tags database...", total=tags_size)
+                    tags_content = await download_file(session, tags_url,
+                                                      progress_bar=main_progress, task_id=tags_download_task)
+
+                    if tags_content is None:
+                        print("Error: Failed to download tags database. Aborting.")
+                        return
+
+                    # Decompress the content
+                    try:
+                        tags_content = gzip.decompress(tags_content).decode()
+                    except Exception as e:
+                        print(f"Error: Failed to decompress tags file: {e}")
+                        return
+
+                    print(f"\033[1mStep 9:\033[0m Reading tags CSV as a DataFrame")
+                    try:
+                        if use_polars:
+                            # Use Polars for faster processing
+                            df = pl.read_csv(io.BytesIO(bytes(tags_content, "utf-8")),
+                                           schema_overrides={"id": pl.Int64, "name": pl.Utf8, "category": pl.Int64, "post_count": pl.Int64})
+
+                            print(f"\033[1mStep 10:\033[0m Filtering DataFrame to only include rows where category is equal to 1 (artists)")
+                            print(f"\033[1mStep 11:\033[0m Keeping only the 'name' column from the DataFrame")
+                            # Filter and select in one operation with Polars
+                            df = df.filter(pl.col("category") == 1).select("name")
+                        else:
+                            df = pds.read_csv(io.BytesIO(bytes(tags_content, "utf-8")), header=0, dtype={"id": int, "name": str, "category": int, "post_count": int})
+
+                            print(f"\033[1mStep 10:\033[0m Filtering DataFrame to only include rows where category is equal to 1 (artists)")
+                            df = df[df["category"] == 1]
+
+                            print(f"\033[1mStep 11:\033[0m Keeping only the 'name' column from the DataFrame")
+                            df = df[["name"]]
+                    except Exception as e:
+                        print(f"Error: Failed to read tags CSV: {e}")
+                        return
+
+                    print(f"\033[1mStep 12:\033[0m Saving DataFrame to artists.parquet")
+                    try:
+                        if os.path.exists('artists.parquet'):
+                            os.remove('artists.parquet')
+
+                        if use_polars:
+                            df.write_parquet("artists.parquet", compression="zstd")
+                        else:
+                            df.to_parquet("artists.parquet", engine='pyarrow', compression='zstd')
+                    except Exception as e:
+                        print(f"Error: Failed to save artists.parquet: {e}")
+                        return
+
+                    print(f"\033[32mStep 13:\033[0m artists.parquet done!\033[0m")
+                    del df
+                    
+            except Exception as e:
+                print(f"Error: An error occurred during processing: {e}")
+                traceback.print_exc()
+                return
+                
     except Exception as e:
-        print("A network error occurred:", e)
-        print("Try to restart the script with the --proxy argument.")
+        print(f"Error: A network error occurred: {e}")
+        if not args.proxy:
+            print("Try to restart the script with the --proxy argument if you're behind a proxy.")
         traceback.print_exc()
 
 # Usage:
 try:
-    asyncio.run(main("https://e621.net/db_export/", proxy=args.proxy, use_multithreaded=args.multithreaded))
+    asyncio.run(main(proxy=args.proxy, use_multithreaded=args.multithreaded))
+except KeyboardInterrupt:
+    print("\nScript interrupted by user.")
 except Exception as e:
-    print("An unexpected error occurred:", e)
+    print(f"An unexpected error occurred: {e}")
     traceback.print_exc()
-
